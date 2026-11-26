@@ -1,185 +1,182 @@
-import streamlit as st
 import os
+import streamlit as st
 from dotenv import load_dotenv
-
 from langchain_groq import ChatGroq
 
 from utils import web_search, scrape_website, read_pdf
 from rag_pipeline import create_vector_store, retrieve_context
 from report_generator import generate_report
-from evaluation import evaluate_rag  # lightweight evaluation
-
-
-# =========================
-# ENV + LLM SETUP
-# =========================
 
 load_dotenv()
-
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-
-llm = ChatGroq(
-    api_key=GROQ_API_KEY,
-    model="llama-3.1-8b-instant",
-    temperature=0.3
-)
-
-# =========================
-# STREAMLIT UI
-# =========================
 
 st.set_page_config(
     page_title="Student Deep Research Assistant",
     page_icon="🎓",
-    layout="wide"
+    layout="wide",
 )
 
 st.title("🎓 Student Deep Research Assistant")
-st.markdown("AI powered research system using **RAG + Web + PDF knowledge**")
+st.markdown("AI-powered research using **RAG + web sources + uploaded PDFs**")
 
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
+
+def get_secret(name: str, default: str = "") -> str:
+    """Read a secret from Streamlit Cloud first, then environment variables."""
+    try:
+        value = st.secrets.get(name, default)
+        if value:
+            return str(value).strip()
+    except Exception:
+        # st.secrets may not exist in a local environment without secrets.toml.
+        pass
+    return os.getenv(name, default).strip()
+
+
+groq_api_key = get_secret("GROQ_API_KEY")
+groq_model = get_secret("GROQ_MODEL", "llama-3.3-70b-versatile")
+
+if not groq_api_key:
+    st.error(
+        "GROQ_API_KEY is missing. Add it in Streamlit Cloud → "
+        "Manage app → Settings → Secrets, or create a local .env file."
+    )
+    st.stop()
+
+try:
+    llm = ChatGroq(
+        api_key=groq_api_key,
+        model=groq_model,
+        temperature=0.3,
+    )
+except Exception as exc:
+    st.error(f"Could not initialize the Groq client: {exc}")
+    st.stop()
 
 query = st.text_input("Enter your research topic")
-pdf = st.file_uploader("Upload PDF for additional knowledge", type=["pdf"])
+pdf_file = st.file_uploader("Upload a PDF for additional knowledge", type=["pdf"])
+run_eval = st.checkbox("Enable performance evaluation")
 
-# Optional evaluation toggle
-run_eval = st.checkbox("Enable Performance Evaluation")
-
-
-# =========================
-# MAIN LOGIC
-# =========================
-
-if st.button("Start Research"):
-
-    progress = st.progress(0)
-
-    text_data = ""
-
-    # =========================
-    # WEB SEARCH
-    # =========================
-
-    st.write("🔎 Searching web sources...")
-
-    urls = web_search(query)
-
-    progress.progress(20)
-
-    # =========================
-    # SCRAPING (IMPROVED)
-    # =========================
-
-    for url in urls:
-        try:
-            content = scrape_website(url)
-            if content:
-                text_data += content
-        except Exception as e:
-            st.warning(f"⚠️ Failed to scrape: {url}")
-
-    progress.progress(40)
-
-    # =========================
-    # PDF PROCESSING
-    # =========================
-
-    if pdf:
-        st.write("📄 Reading PDF...")
-        text_data += read_pdf(pdf)
-
-    progress.progress(60)
-
-    # =========================
-    # ❗ CRITICAL FIX (EMPTY DATA CHECK)
-    # =========================
-
-    if not text_data.strip():
-        st.error("❌ No data could be retrieved. Try a different query or upload a PDF.")
+if st.button("Start Research", type="primary"):
+    if not query.strip() and pdf_file is None:
+        st.warning("Enter a research topic or upload a PDF.")
         st.stop()
 
-    # =========================
-    # VECTOR DB
-    # =========================
+    progress = st.progress(0)
+    status = st.empty()
+    collected_text = []
+    source_urls = []
 
-    st.write("🧠 Creating knowledge base...")
+    # Web search is optional when the user only wants to query an uploaded PDF.
+    if query.strip():
+        status.write("🔎 Searching the web...")
+        try:
+            source_urls = web_search(query, max_results=5)
+        except Exception as exc:
+            st.warning(f"Web search is temporarily unavailable: {exc}")
+            source_urls = []
+    progress.progress(20)
 
-    vector_db = create_vector_store(text_data)
+    status.write("🌐 Extracting website content...")
+    for url in source_urls:
+        try:
+            page_text = scrape_website(url)
+            if page_text:
+                collected_text.append(f"Source URL: {url}\n{page_text}")
+        except Exception as exc:
+            st.warning(f"Could not read {url}: {exc}")
+    progress.progress(40)
 
-    progress.progress(80)
+    if pdf_file is not None:
+        status.write("📄 Extracting PDF text...")
+        try:
+            pdf_text = read_pdf(pdf_file)
+            if pdf_text.strip():
+                collected_text.append(
+                    f"Uploaded PDF: {pdf_file.name}\n{pdf_text}"
+                )
+            else:
+                st.warning("No selectable text was found in the PDF. "
+                           "Scanned PDFs may require OCR.")
+        except Exception as exc:
+            st.error(f"Could not read the uploaded PDF: {exc}")
+            st.stop()
+    progress.progress(60)
 
-    context = retrieve_context(vector_db, query)
+    full_text = "\n\n".join(collected_text).strip()
+    if not full_text:
+        st.error(
+            "No content was retrieved. Try another search query or upload "
+            "a text-based PDF. If web search is blocked, try again later."
+        )
+        st.stop()
 
-    # =========================
-    # LLM ANSWER
-    # =========================
+    try:
+        status.write("🧠 Building the knowledge base...")
+        vector_db = create_vector_store(full_text)
+        progress.progress(80)
 
-    st.write("🤖 Generating research answer...")
+        search_query = query.strip() or "Summarize the uploaded document"
+        context = retrieve_context(vector_db, search_query)
 
-    answer_prompt = f"""
-You are a research assistant.
+        if not context.strip():
+            st.error("The retriever did not return any relevant content.")
+            st.stop()
 
-Answer the following query using the provided context.
+        status.write("🤖 Generating the research answer...")
+        answer_prompt = f"""
+You are a careful academic research assistant.
+Answer the user's question using the supplied context.
+Do not invent facts that are not supported by the context.
+If the context is insufficient, clearly say what is missing.
+Use clear headings and explain important concepts.
 
 Context:
 {context}
 
-Query:
-{query}
+User question:
+{search_query}
 """
+        answer = llm.invoke(answer_prompt).content
+        report = generate_report(llm, context, search_query, source_urls)
 
-    answer = llm.invoke(answer_prompt).content
+        progress.progress(100)
+        status.success("Research completed.")
 
-    progress.progress(100)
+        st.subheader("📚 Research Answer")
+        st.markdown(answer)
 
-    # =========================
-    # DISPLAY ANSWER
-    # =========================
+        st.subheader("📑 Structured Research Report")
+        st.markdown(report)
 
-    st.subheader("📚 Research Answer")
-    st.write(answer)
+        if run_eval:
+            try:
+                from evaluation import evaluate_rag
+                with st.spinner("Evaluating the generated answer..."):
+                    metrics = evaluate_rag(
+                        search_query,
+                        answer,
+                        [context],
+                    )
+                st.subheader("📊 Performance Metrics")
+                st.json(metrics)
+            except Exception as exc:
+                st.warning(f"Evaluation could not be completed: {exc}")
 
-    # =========================
-    # REPORT GENERATION
-    # =========================
+        st.subheader("🔗 Sources")
+        if source_urls:
+            for url in source_urls:
+                st.markdown(f"- [{url}]({url})")
+        elif pdf_file is not None:
+            st.write(f"Uploaded document: {pdf_file.name}")
+        else:
+            st.write("No external sources were retrieved.")
 
-    report = generate_report(llm, context, query)
+        st.download_button(
+            label="Download Research Report",
+            data=report,
+            file_name="research_report.md",
+            mime="text/markdown",
+        )
 
-    st.subheader("📑 Structured Research Report")
-    st.write(report)
-
-    # =========================
-    # PERFORMANCE EVALUATION
-    # =========================
-
-    if run_eval:
-        try:
-            contexts_list = context.split("\n")
-
-            metrics = evaluate_rag(query, answer, contexts_list)
-
-            st.subheader("📊 Performance Metrics")
-            st.write(metrics)
-
-        except Exception as e:
-            st.warning("⚠️ Evaluation could not be computed.")
-
-    # =========================
-    # SOURCES
-    # =========================
-
-    st.subheader("🔗 Sources")
-
-    for u in urls:
-        st.write(u)
-
-    # =========================
-    # DOWNLOAD REPORT
-    # =========================
-
-    st.download_button(
-        label="Download Research Report",
-        data=report,
-        file_name="research_report.txt"
-    )   
+    except Exception as exc:
+        st.error(f"Research pipeline failed: {exc}")
+        st.exception(exc)
