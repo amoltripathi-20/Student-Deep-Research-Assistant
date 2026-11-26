@@ -1,80 +1,48 @@
+import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 from sentence_transformers import SentenceTransformer
-import numpy as np
-
-# Load model once
-model = SentenceTransformer("all-MiniLM-L6-v2")
 
 
-def evaluate_rag(query, answer, contexts):
+_model = None
 
-    try:
-        # 🔥 Clean contexts properly (same as your original code)
-        contexts = [c.strip() for c in contexts if c.strip()]
 
-        if len(contexts) == 0:
-            return {
-                "Relevance Score": 0,
-                "Faithfulness Score": 0,
-                "Precision Score": 0,
-                "Recall Score": 0,
-                "Groundedness Score": 0
-            }
+def _get_model():
+    global _model
+    if _model is None:
+        _model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+    return _model
 
-        # =========================
-        # EMBEDDINGS (same logic)
-        # =========================
-        query_emb = model.encode([query])
-        answer_emb = model.encode([answer])
-        context_emb = model.encode(contexts)
 
-        # =========================
-        # EXISTING METRICS
-        # =========================
+def evaluate_rag(query: str, answer: str, contexts: list[str]) -> dict:
+    """
+    Lightweight embedding-similarity indicators.
 
-        # Relevance → Query vs Answer
-        relevance = cosine_similarity(query_emb, answer_emb)[0][0]
-
-        # Faithfulness → Answer vs Context (average)
-        faithfulness = np.mean(cosine_similarity(answer_emb, context_emb))
-
-        # =========================
-        # NEW METRICS (ADDED)
-        # =========================
-
-        # Precision → how much answer is supported by best matching context
-        precision = np.max(cosine_similarity(answer_emb, context_emb))
-
-        # Recall → how much of context is covered in answer
-        recall = np.mean(cosine_similarity(context_emb, answer_emb))
-
-        # Groundedness → strictest alignment (worst-case similarity)
-        groundedness = np.min(cosine_similarity(answer_emb, context_emb))
-
-        # =========================
-        # NORMALIZATION (same style)
-        # =========================
-
-        relevance = (relevance + 1) / 2
-        faithfulness = (faithfulness + 1) / 2
-        precision = (precision + 1) / 2
-        recall = (recall + 1) / 2
-        groundedness = (groundedness + 1) / 2
-
+    These are similarity-based proxies, not formal factuality guarantees
+    or a substitute for human evaluation.
+    """
+    contexts = [item.strip() for item in (contexts or []) if item and item.strip()]
+    if not query.strip() or not answer.strip() or not contexts:
         return {
-            "Relevance Score": round(float(relevance), 3),
-            "Faithfulness Score": round(float(faithfulness), 3),
-            "Precision Score": round(float(precision), 3),
-            "Recall Score": round(float(recall), 3),
-            "Groundedness Score": round(float(groundedness), 3)
+            "Relevance Similarity": 0.0,
+            "Context Alignment": 0.0,
+            "Best Context Similarity": 0.0,
+            "Context Coverage Proxy": 0.0,
+            "Lowest Context Similarity": 0.0,
         }
 
-    except Exception as e:
-        return {
-            "Relevance Score": 0,
-            "Faithfulness Score": 0,
-            "Precision Score": 0,
-            "Recall Score": 0,
-            "Groundedness Score": 0,
-            "Error": str(e)
-        }
+    model = _get_model()
+    query_emb = model.encode([query], normalize_embeddings=True)
+    answer_emb = model.encode([answer], normalize_embeddings=True)
+    context_emb = model.encode(contexts, normalize_embeddings=True)
+
+    answer_context_scores = cosine_similarity(answer_emb, context_emb)[0]
+    relevance = float(cosine_similarity(query_emb, answer_emb)[0][0])
+
+    return {
+        "Relevance Similarity": round(relevance, 3),
+        "Context Alignment": round(float(np.mean(answer_context_scores)), 3),
+        "Best Context Similarity": round(float(np.max(answer_context_scores)), 3),
+        "Context Coverage Proxy": round(float(np.mean(answer_context_scores)), 3),
+        "Lowest Context Similarity": round(float(np.min(answer_context_scores)), 3),
+        "Note": "Embedding similarity indicators; not a factuality guarantee.",
+    }
